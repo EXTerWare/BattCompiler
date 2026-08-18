@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import shutil
+import os
 from pathlib import Path
 
 # Set the Python Executable variable
@@ -18,9 +19,16 @@ def printf(prv):
         print(f"{prefix}{prv}")
 
 # Compile the bat file
-def compile_file(batfil, bat_file_path):
-    print("Compiling batch!")
+def compile_file(batfil, bat_file_path, original_bat_path):
     printf(f"Starting compilation of {batfil}")
+
+    # Get absolute path of the batch file
+    original_bat_abs = Path(original_bat_path).resolve()
+    printf(f"Absolute batch path: {original_bat_abs}")
+
+    if not original_bat_abs.is_file():
+        print(f"Error: Batch file not found at {original_bat_abs}")
+        return
 
     # Build PyInstaller command
     command = [
@@ -30,6 +38,14 @@ def compile_file(batfil, bat_file_path):
         "--onefile",
         "--noconfirm"
     ]
+
+    # Bundle the batch file inside the EXE
+    if os.name == 'nt':  # Windows
+        add_data = f"{original_bat_abs};."
+    else:  # Linux/Mac
+        add_data = f"{original_bat_abs}:."
+    command.append(f"--add-data={add_data}")
+    printf(f"Added data: {add_data}")
 
     # Check for icon argument
     if icon_arg := next((arg for arg in sys.argv if arg.lower().startswith("--icon:")), None):
@@ -54,29 +70,32 @@ def compile_file(batfil, bat_file_path):
     command.append(".temp/bat.py")
     printf(f"Running command: {' '.join(map(str, command))}")
 
-    # Run PyInstaller
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-
-    pyinstaller_output = []
-    for line in process.stdout:
-        pyinstaller_output.append(line)
-        printf(line.rstrip())
-
-    exit_code = process.wait()
-
-    if exit_code != 0:
-        print("\nError: PyInstaller failed to compile the program.")
-        print(f"PyInstaller exit code: {exit_code}")
-        if "--debug" not in sys.argv:
-            print("\nPyInstaller output:")
+    # Run PyInstaller - SUPPRESS all output unless --debug
+    if "--debug" in sys.argv:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        pyinstaller_output = []
+        for line in process.stdout:
+            pyinstaller_output.append(line)
+            printf(line.rstrip())
+        exit_code = process.wait()
+        if exit_code != 0:
+            print("\nError: PyInstaller failed to compile the program.")
+            print(f"PyInstaller exit code: {exit_code}")
             print("".join(pyinstaller_output))
-        return
+            return
+    else:
+        # SILENT mode - no output unless something fails
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("Error: PyInstaller failed to compile the program.")
+            print(result.stderr)
+            return
 
     # Check that PyInstaller actually created the EXE
     generated_exe = Path("dist/bat.exe")
@@ -95,8 +114,8 @@ def compile_file(batfil, bat_file_path):
     # Move EXE beside the original BAT
     generated_exe.replace(final_exe)
 
-    print(f"Compilation successful! EXE created at:")
-    print(final_exe)
+    # Only print success message (users need to know where the EXE is)
+    print(f"\n✅ Compiled: {final_exe}")
 
     printf("Cleaning temporary files.")
     Path(".temp/bat.py").unlink(missing_ok=True)
@@ -111,14 +130,41 @@ def convertBatchtoEXE(batfile, bat_file_path):
     file_path = Path(".temp/bat.py")
     printf("Creating temporary Python file")
 
+    # Get the batch filename only (for bundling)
+    batch_filename = bat_file_path.name
+    printf(f"Batch filename: {batch_filename}")
+
+    # WRAPPER: SILENT - only passes batch output through
     code_content = (
         f"import subprocess\n"
-        f"subprocess.run({batfile!r}, shell=True, text=True)\n"
+        f"import sys\n"
+        f"import os\n"
+        f"from pathlib import Path\n\n"
+        f"def main():\n"
+        f"    if getattr(sys, 'frozen', False):\n"
+        f"        base_dir = Path(sys._MEIPASS)\n"
+        f"    else:\n"
+        f"        base_dir = Path(__file__).parent\n\n"
+        f"    batch_file = base_dir / {batch_filename!r}\n\n"
+        f"    if not batch_file.exists():\n"
+        f"        sys.exit(1)\n\n"
+        f"    # Run the batch file - output goes directly to console\n"
+        f"    result = subprocess.run(\n"
+        f"        [str(batch_file)],\n"
+        f"        cwd=str(base_dir),\n"
+        f"        shell=True,\n"
+        f"        text=True\n"
+        f"    )\n"
+        f"    sys.exit(result.returncode)\n\n"
+        f"if __name__ == '__main__':\n"
+        f"    main()\n"
     )
 
     file_path.write_text(code_content, encoding="utf-8")
     printf(f"Temporary file created at {file_path}")
-    compile_file(file_path, bat_file_path)
+    
+    # Pass the FULL PATH to the original batch file for bundling
+    compile_file(file_path, bat_file_path, str(bat_file_path.resolve()))
 
 # This is the entry point that project.scripts will hook into
 def start():
@@ -126,20 +172,22 @@ def start():
         bat_file = file_arg.split(":", 1)[1]
         batch = Path(bat_file)
 
-        if bat_file.lower().endswith((".bat", ".cmd")):
-            if batch.is_file():
-                print("The file exists!")
-                if not Path(".temp").is_dir():
-                    Path(".temp").mkdir()
-                convertBatchtoEXE(bat_file, batch)
-            else:
-                print("Error: File not found.")
-                sys.exit(1)
-        else:
+        if not batch.suffix.lower() in (".bat", ".cmd"):
             print("Error: File must be a .bat or .cmd file. Exiting!")
             sys.exit(1)
+            
+        if not batch.is_file():
+            print(f"Error: File '{bat_file}' not found.")
+            sys.exit(1)
+
+        # Create temp directory
+        if not Path(".temp").is_dir():
+            Path(".temp").mkdir()
+            
+        convertBatchtoEXE(bat_file, batch)
     else:
         print("Error: No --file argument provided. Exiting!")
+        print("Usage: battc --file:script.bat [--icon:icon.ico] [--debug]")
         sys.exit(1)
 
 # Allows you to still run it locally during development via 'python batt.py'
